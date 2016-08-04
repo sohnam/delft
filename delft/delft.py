@@ -36,7 +36,7 @@ from keras import regularizers
 from keras.layers import Input, LSTM, RepeatVector, Dense
 from keras.models import Model
 
-from sklearn.preprocessing import StandardScaler, RobustScaler, MaxAbsScaler, MinMaxScaler
+from sklearn.preprocessing import Imputer, StandardScaler, RobustScaler, MaxAbsScaler, MinMaxScaler
 from sklearn.cross_validation import train_test_split
 
 import warnings
@@ -67,17 +67,44 @@ class Classified_DF(Encoded_DF): pass
 
 class Dropout_Rate(object): pass
 
+class Imputed_DF(object): pass
+
 class Optimizer(object): pass
 
 class Output_DF(object): pass
 
 class Scaled_DF(object): pass
 
+class Strategy(object): pass
+
 class Autoencoder(object):
 
     def __init__(self, compression_factor,
                  encoder_activation, decoder_activation,
-                 optimizer, activity_regularizer, dropout_rate, nb_epoch=50):
+                 optimizer, activity_regularizer, dropout_rate, non_feature_columns, nb_epoch=50):
+        """
+        Initializes one layer of an artificial neural network
+
+        Parameters
+        ----------
+        compression_factor: float
+            The number of neurons in this layer is determined by dividing the number of neurons in the previous
+            layer by the compression factor. A compression factor greater than 0 and less than 1 causes an expansion.
+        encoder_activation: Activation
+            The activation function of this layer
+        decoder_activation: Activation
+            The activation function of the decoding layer that corresponds to this encoding layer in a
+            stacked autoencoder architecture. Used in pre-training a neural network.
+        optimizer: Optimizer
+            The optimization method to control the gradient steps of the algorithm.
+            Only the optimizer in the first layer is used.
+        activity_regularizer: Activity_Regularizer
+            The activity regularizer to help the algorithm find simpler models and generalize better.
+        dropout_rate: 0 <= float <= 1
+            Percentage of the input values of this layer that will be set to zero.
+        nb_epoch: int (Default: 50)
+            Number of epochs for pre-training and training this layer.
+        """
 
         self.compression_factor = compression_factor
         self.encoder_activation = encoder_activation
@@ -86,53 +113,52 @@ class Autoencoder(object):
         self.optimizer = optimizer
         self.activity_regularizer = activity_regularizer
         self.dropout_rate = dropout_rate
+        self.non_feature_columns = non_feature_columns
 
-    def set_model(self, model):
-        self.model = model
-
-    def set_dataframe(self, input_df):
-        self.dataframe = input_df
-
-    def get_dataframe(self):
-        return self.dataframe
-
-    def get_code(self, input_df):
+    def start_encoder(self, train_df, validate_df):
         """
-        Generates a code (encoding) from the input.
-        A model must first have been trained.
+        Creates the first hidden layer in a stacked autoencoder or neural network, and connects it to the input
+        layer. This method also instantiates the Input class from Keras, and must be called before calling
+        the `stack_encoder` method of this class.
 
         Parameters
         ----------
-        :input_df: pandas DataFrame
+        train_df: pandas.DataFrame
+            training set.
+        validate_df: pandas.DataFrame
+            validation set.
+        excess_columns: int
+            The number of columns added to train_df and validate_df by TPOT that are not features of the data.
+            For example, "guess", "class", and "group" are non-feature columns in train_df and validate_df,
+            so excess_columns is 3. This value is calculated by len(non_feature_columns) when this method is called.
 
         Returns
-        ----------
-        numpy 2darray
+        -------
+        None
 
         """
-        #maximo = ceil(input_df.max().max())
-        #input_df = input_df / maximo
-        return self.encoder.predict(input_df.values)
-
-    def get_reconstruction(self, input_df):
-        return self.model.predict(input_df.values)
-
-    def start_encoder(self, train_df, validate_df, excess_columns):
         try:
             self.train_df = train_df
             self.validate_df = validate_df
-            nbr_columns = train_df.shape[1] - excess_columns
+            nbr_columns = train_df.shape[1] - len(self.non_feature_columns)
+
+            self.train_df_noisy = train_df.copy(deep=True).drop(self.non_feature_columns, axis=1).astype(np.float64)
+            self.__dropout__(self.train_df_noisy, ceil(nbr_columns*self.dropout_rate))
+            self.validate_df_noisy = validate_df.copy(deep=True).drop(self.non_feature_columns, axis=1).astype(np.float64)
+            self.__dropout__(self.validate_df_noisy, ceil(nbr_columns*self.dropout_rate))
+
             self.nbr_columns = nbr_columns
-            nbr_drop_columns = int(nbr_columns*self.dropout_rate)
+            _input = Input(shape=(nbr_columns,))
+            self.input = _input
 
             if self.compression_factor == 0:
                 # Behavior undefined. Do not change feature space.
                 self.compression_factor = 1
 
+            # encoding_dim is the number of columns in this layer, nbr_columns is the number of columns in the previous
+            # layer.
             encoding_dim = ceil(nbr_columns / self.compression_factor)
             self.encoding_dim = encoding_dim
-            _input = Input(shape=(nbr_columns,))
-            self.input = _input
 
             code_layer = Dense(encoding_dim, activation=self.encoder_activation,
                                activity_regularizer=self.activity_regularizer)(_input)
@@ -142,17 +168,37 @@ class Autoencoder(object):
             print(e)
 
     def stack_encoder(self, nbr_columns, code_layer, _input):
+        """
+        Creates any hidden layer, except the first hidden layer, in a stacked autoencoder or neural network,
+        and connects the previous layer to this layer.
+        For creating the first layer, see Autoencoder.start_encoder.
+
+        Parameters
+        ----------
+        nbr_columns: int
+            The number of columns in the previous layer.
+        code_layer: Keras.Dense
+            The hidden layer immediately preceding this layer. code_layer will pass its activation to this layer.
+        _input: Keras.Input
+            The input layer created by `Autoencoder.start_encoder`
+
+        Returns
+        -------
+        None
+
+        """
         try:
             self.input = _input
             self.nbr_columns = nbr_columns
-            nbr_drop_columns = int(nbr_columns * self.dropout_rate)
 
             if self.compression_factor == 0:
                 # Behavior undefined. Do not change feature space.
                 self.compression_factor = 1
 
+            # encoding_dim is the number of columns in this layer
             encoding_dim = ceil(nbr_columns / self.compression_factor)
             self.encoding_dim = encoding_dim
+
             code_layer = Dense(encoding_dim, activation=self.encoder_activation,
                                activity_regularizer=self.activity_regularizer)(code_layer)
             self.code_layer = code_layer
@@ -160,55 +206,23 @@ class Autoencoder(object):
         except Exception as e:
             print(e)
 
-
-    def train(self, train_df, validate_df):
+    def __dropout__(self, input_df, nbr_drop_columns):
         """
-        Establishes a reconstruction model and encoder, and trains these on the input.
-        Validation set is drawn from the input.
+        Zeroes out n columns per example in input_df, where n is the number specified by nbr_columns.
+        The columns to be zeroed out are chosen independently at random.
 
         Parameters
         ----------
-        :train_df:    pandas DataFrame, training set.
-        :validate_df: pandas DataFrame, validation set.   
+        input_df: pandas.DataFrame
+            The input dataset
+        nbr_drop_columns: int
+            Number of columns per example to zero out
 
         Returns
-        ----------
+        -------
         None
 
         """
-        try:
-            nbr_columns = train_df.shape[1]
-            self.nbr_columns = nbr_columns
-            nbr_drop_columns = int(nbr_columns*self.dropout_rate)
-
-            if nbr_drop_columns > 0:
-                self.__dropout__(train_df, nbr_drop_columns)
-            if self.compression_factor == 0:
-                # Behavior undefined. Do not change feature space.
-                self.compression_factor = 1
-
-            encoding_dim = ceil(nbr_columns / self.compression_factor)
-
-            input = Input(shape=(nbr_columns,))
-            code_layer = Dense(encoding_dim, activation=self.encoder_activation,
-                               activity_regularizer=self.activity_regularizer)(input)
-            reconstruction_layer = Dense(nbr_columns, activation=self.decoder_activation)(code_layer)
-
-            model = Model(input=input, output=reconstruction_layer)
-            self.model = model
-
-            encoder = Model(input=input, output=code_layer)
-            self.encoder = encoder
-
-            model.compile(optimizer=self.optimizer, loss='binary_crossentropy')
-
-            model.fit(train_df.values, train_df.values, nb_epoch=self.nb_epoch, batch_size=256, verbose=1,
-                            shuffle=True, validation_data=(validate_df.values, validate_df.values))
-
-        except Exception as e:
-            print(e)
-
-    def __dropout__(self, input_df, nbr_drop_columns):
         columns = [j for j in input_df.columns]
         for i in input_df.index:
             np.random.shuffle(columns)
@@ -220,7 +234,6 @@ class TPOT(object):
     """TPOT automatically creates and optimizes machine learning pipelines using genetic programming."""
 
     update_checked = False
-    encoder_stack = []
 
     def __init__(self, population_size=100, generations=100,
                  mutation_rate=0.9, crossover_rate=0.05,
@@ -299,25 +312,25 @@ class TPOT(object):
 
         # Neural Network operators
         self._pset.addPrimitive(self._autoencoder, [Scaled_DF, Compression_Factor, Activation,
-                                                    Activation, Optimizer, Activity_Regularizer,
+                                                    Activation, Optimizer, Dropout_Rate, Activity_Regularizer,
                                                     Activity_Regularization_Parameter,
                                                     Activity_Regularization_Parameter], Classified_DF)
 
         self._pset.addPrimitive(self._hidden_autoencoder, [Encoded_DF, Compression_Factor, Activation,
-                                                    Activation, Optimizer, Activity_Regularizer,
+                                                    Activation, Optimizer, Dropout_Rate, Activity_Regularizer,
                                                     Activity_Regularization_Parameter,
                                                     Activity_Regularization_Parameter], Encoded_DF)
 
         self._pset.addPrimitive(self._compile_autoencoder, [Encoded_DF], Output_DF)
 
         # Feature preprocessing operators
-        self._pset.addPrimitive(self._standard_scaler, [pd.DataFrame], Scaled_DF)
-        self._pset.addPrimitive(self._robust_scaler, [pd.DataFrame], Scaled_DF)
-        self._pset.addPrimitive(self._min_max_scaler, [pd.DataFrame], Scaled_DF)
-        self._pset.addPrimitive(self._max_abs_scaler, [pd.DataFrame], Scaled_DF)
+        self._pset.addPrimitive(self._standard_scaler, [Imputed_DF], Scaled_DF)
+        self._pset.addPrimitive(self._robust_scaler, [Imputed_DF], Scaled_DF)
+        self._pset.addPrimitive(self._min_max_scaler, [Imputed_DF], Scaled_DF)
+        self._pset.addPrimitive(self._max_abs_scaler, [Imputed_DF], Scaled_DF)
 
         # Imputer operators
-
+        self._pset.addPrimitive(self._imputer, [pd.DataFrame, Strategy], Imputed_DF)
         # Terminals
         int_terminals = np.concatenate((np.arange(0, 51, 1),
                 np.arange(60, 110, 10)))
@@ -335,6 +348,9 @@ class TPOT(object):
 
         for val in np.linspace(0.1, 10, 100):
             self._pset.addTerminal(val, Compression_Factor)
+            if val <= 1:
+                for i in range(20):
+                    self._pset.addTerminal(val, Compression_Factor)
 
         self._pset.addTerminal(True, Bool)
         self._pset.addTerminal(False, Bool)
@@ -360,11 +376,20 @@ class TPOT(object):
         self._pset.addTerminal(2, Activity_Regularizer)
         self._pset.addTerminal(3, Activity_Regularizer)
 
+        self._pset.addTerminal("mean", Strategy)
+        self._pset.addTerminal("median", Strategy)
+        self._pset.addTerminal("most_frequent", Strategy)
+
         for val in np.concatenate(([1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1], np.linspace(0., 1., 101))):
             self._pset.addTerminal(val, Activity_Regularization_Parameter)
-            #self._pset.addTerminal(val, Dropout_Rate)
 
-        # Dummies for DEAP mutation, never produce a better pipeline
+        for val in np.linspace(0., .65, 101):
+            self._pset.addTerminal(val, Dropout_Rate)
+
+        for i in range(15):
+            self._pset.addTerminal(0.0, Dropout_Rate)
+
+        # Dummies for DEAP mutation, never produce a better pipeline, necessary to avoid execution halting exception
         self._pset.addTerminal([0,0], Classified_DF )
         self._pset.addTerminal([0,0], Scaled_DF)
 
@@ -389,6 +414,21 @@ class TPOT(object):
             self.scoring_function = scoring_function
 
     def set_training_classes_vectorized(self, classes_vec):
+        """
+        Call this method before fitting TPOT.
+        DELFT needs both forms of the class: vector form and scalar form.
+        This method allows the user to set the vector form of the labels in the training dataset.
+
+        Parameters
+        ----------
+        classes_vec: numpy.array
+            an n-by-m matrix of n examples and m classes
+            Every column contains zeroes (0), except for one column, which contains a 1.
+
+        Returns
+        -------
+        None
+        """
         self._training_classes_vec = classes_vec
 
     def fit(self, features, classes):
@@ -412,10 +452,11 @@ class TPOT(object):
 
         """
         try:
-
-            # Store the training features and classes for later use
+            # Fitting and not scoring flag.
             self._training_testing_data = False
             # self._training_classes_vec = (np.arange(max(classes) + 1) == classes[:, None]).astype(np.float32)
+
+            # Store the training features and classes for later use
             self._training_features = features
             self._training_classes = classes
 
@@ -573,7 +614,6 @@ class TPOT(object):
         return self.predict(features)
 
     def score(self, testing_features, testing_classes):
-        # type: (object, object) -> object
         """Estimates the testing accuracy of the optimized pipeline.
 
         Parameters
@@ -612,7 +652,8 @@ class TPOT(object):
             if type(column) != str:
                 new_col_names[column] = str(column).zfill(10)
         training_testing_data.rename(columns=new_col_names, inplace=True)
-
+        for pipeline in self.hof:
+            print("Paretto Front: {}".format(pipeline))
         return self._evaluate_individual(self._optimized_pipeline, training_testing_data)[1]
 
     def get_params(self, deep=None):
@@ -665,10 +706,58 @@ class TPOT(object):
         with open(output_file_name, 'w') as output_file:
             output_file.write(pipeline_text)
 
-    def _autoencoder(self, input_df, compression_factor, encoder_acivation,
-                     decoder_activation, optimizer, activity_regularizer,
-                     activity_regularizer_param1, activity_regularizer_param2):
+    def _imputer(self, input_df, strategy):
+        # http://stackoverflow.com/questions/6736590/fast-check-for-nan-in-numpy
+        input_data = input_df.drop(self.non_feature_columns, axis=1).values
+        if np.isnan(np.sum(input_data)):
+            imputer = Imputer(strategy=strategy)
+            imputer.fit(input_data)
+            input_data = imputer.transform(input_data)
+            input_df_imputed = pd.DataFrame(data=input_data)
+            input_df_imputed[self.non_feature_columns] = input_df[self.non_feature_columns]
+            return input_df_imputed
+        else:
+            return input_df
 
+    def _autoencoder(self, input_df, compression_factor, encoder_acivation,
+                     decoder_activation, optimizer, dropout_rate, activity_regularizer,
+                     activity_regularizer_param1, activity_regularizer_param2):
+        """
+        First layer of an artificial neural network
+
+        Parameters
+        ----------
+        input_df: pandas.DataFrame {n_samples, n_features+['class', 'group', 'guess']}
+            Input dataframe.
+        compression_factor: Compression_Factor, range (0, 10]
+            Determines the number of neurons in the first hidden layer.
+        encoder_activation: Activation
+            The activation function of this layer
+        decoder_activation: Activation
+            The activation function of the decoding layer that corresponds to this encoding layer in a
+            stacked autoencoder architecture. Used in pre-training a neural network.
+        optimizer: Optimizer
+            The optimization method to control the gradient steps of the algorithm.
+            Only the optimizer in the first layer is used.
+        dropout_rate: 0 <= float <= 1
+            Percentage of the input values of this layer that will be set to zero.
+        activity_regularizer: Activity_Regularizer
+            The activity regularizer to help the algorithm find simpler models and generalize better.
+        activity_regularizer_param1: Activity_Regularization_Parameter
+            First activity regularization parameter
+        activity_regularizer_param2: Activity_Regularization_Parameter
+            Second activity regularization parameter. Only used when using l1l2 activity regularization.
+
+        Returns
+        -------
+        (encoding_dim, code_layer, input), where
+        encoding_dim: int
+            Number of neurons in the first layer.
+        code_layer: Keras.Dense
+            The first hidden layer.
+        input: Keras.Input
+            The input layer.
+        """
         # reset the encoder stack
         # used to build and fit stacked autoencoders with arbitrary number of layers
         self.encoder_stack = []
@@ -684,25 +773,63 @@ class TPOT(object):
 
         autoencoder = Autoencoder(compression_factor=compression_factor, encoder_activation=encoder_acivation,
                             decoder_activation=decoder_activation, optimizer=optimizer,
-                            activity_regularizer=activity_regularizer, dropout_rate=0.0)
+                            activity_regularizer=activity_regularizer, dropout_rate=dropout_rate,
+                                  non_feature_columns=self.non_feature_columns)
 
         train_df = input_df.loc[input_df['group'] == 'training']
         test_df = input_df.loc[input_df['group'] == 'testing']
 
-        autoencoder.start_encoder(train_df, test_df, len(self.non_feature_columns))
+        autoencoder.start_encoder(train_df, test_df)
         self.encoder_stack.append(autoencoder)
 
         return autoencoder.encoding_dim, autoencoder.code_layer, autoencoder.input
 
     def _hidden_autoencoder(self, input_tuple, compression_factor, encoder_acivation,
-                     decoder_activation, optimizer, activity_regularizer,
+                     decoder_activation, optimizer, dropout_rate, activity_regularizer,
                      activity_regularizer_param1, activity_regularizer_param2):
+        """
+        Any hidden layer, except the first hidden layer, of an artificial neural network.
+
+        Parameters
+        ----------
+        input_tuple: (int, Keras.Dense, Keras.Input)
+            The output from either the preceding self._autoencoder or the preceding self._hidden_autoencoder
+            This information is needed to connect the next hidden layer.
+        compression_factor: Compression_Factor, range (0, 10]
+            Determines the number of neurons in this hidden layer.
+        encoder_activation: Activation
+            The activation function of this layer
+        decoder_activation: Activation
+            The activation function of the decoding layer that corresponds to this encoding layer in a
+            stacked autoencoder architecture. Used in pre-training a neural network.
+        optimizer: Optimizer
+            The optimization method to control the gradient steps of the algorithm.
+            Only the optimizer in the first layer is used.
+        dropout_rate: 0 <= float <= 1
+            Percentage of the input values of this layer that will be set to zero.
+        activity_regularizer: Activity_Regularizer
+            The activity regularizer to help the algorithm find simpler models and generalize better.
+        activity_regularizer_param1: Activity_Regularization_Parameter
+            First activity regularization parameter
+        activity_regularizer_param2: Activity_Regularization_Parameter
+            Second activity regularization parameter. Only used when using l1l2 activity regularization.
+
+        Returns
+        -------
+        (encoding_dim, code_layer, input), where
+        encoding_dim: int
+            Number of neurons in this layer.
+        code_layer: Keras.Dense
+            This hidden layer.
+        input: Keras.Input
+            The input layer (from the first layer).
+        """
 
         if type(input_tuple) == type(pd.DataFrame):
             # Just as a precaution. In case an evolved pipeline attaches _hidden_autoencoder
             # without first attaching an _autoencoder
             return self._autoencoder(input_tuple, compression_factor, encoder_acivation,
-                                     decoder_activation, optimizer, activity_regularizer,
+                                     decoder_activation, optimizer, dropout_rate, activity_regularizer,
                                      activity_regularizer_param1, activity_regularizer_param2)
 
         # nbr_columns, code_layer, _input = input_tuple
@@ -718,14 +845,30 @@ class TPOT(object):
 
         autoencoder = Autoencoder(compression_factor=compression_factor, encoder_activation=encoder_acivation,
                                   decoder_activation=decoder_activation, optimizer=optimizer,
-                                  activity_regularizer=activity_regularizer, dropout_rate=0.0)
+                                  activity_regularizer=activity_regularizer, dropout_rate=dropout_rate,
+                                  non_feature_columns=self.non_feature_columns)
 
         autoencoder.stack_encoder(*input_tuple)
 
         self.encoder_stack.append(autoencoder)
-        return input_tuple
+        return autoencoder.encoding_dim, autoencoder.code_layer, autoencoder.input
 
     def _compile_autoencoder(self, input_df):
+        """
+        Pre-trains the stacked autoencoder, and then connects the first half of the stacked autoencoder
+        to a classification layer to convert it into an artificial neural network. This method is necessary
+        because it pops encoders from a LIFO stack to build their corresponding decoders.
+
+        Parameters
+        ----------
+        input_df: DUMMY
+            used for strong typing in DEAP.
+
+        Returns
+        -------
+        input_df: pandas.DataFrame {n_samples, n_features + ['guess', 'group', 'class']}
+            Returns a DataFrame containing the classification guesses for each example.
+        """
 
         if self._training_testing_data:
             # This runs when we are scoring the test set.
@@ -733,12 +876,13 @@ class TPOT(object):
 
         optimizer = self.encoder_stack[0].optimizer
         train_df = self.encoder_stack[0].train_df
+        train_data_noisy = self.encoder_stack[0].train_df_noisy
         validate_df = self.encoder_stack[0].validate_df
+        validate_data_noisy = self.encoder_stack[0].validate_df_noisy
         nb_epoch = self.encoder_stack[0].nb_epoch * len(self.encoder_stack)
 
         self.encoder_stack.reverse()
         encoded_layer = self.encoder_stack[0].code_layer
-
 
         train_data = train_df.drop(self.non_feature_columns, axis=1).astype(np.float64)
         validate_data = validate_df.drop(self.non_feature_columns, axis=1).astype(np.float64)
@@ -747,6 +891,7 @@ class TPOT(object):
         _input = None
         target_layer = None
         hashable = []
+
         for autoencoder in self.encoder_stack:
             _input = autoencoder.input
             if decoder is None:
@@ -757,24 +902,30 @@ class TPOT(object):
             hashable.append(autoencoder.decoder_activation)
 
 
-
+        # Stacked Autoencoder, reconstructor
         model = Model(input=_input, output=decoder)
+
+        # Stacked Autoencoder, encoder
         encoder = Model(input=_input, output=encoded_layer)
+
+        # Artificial Neural Network, classifier
         classifier = Model(input=_input, output=target_layer)
 
-        # Unsupervised pretraining
+        # Unsupervised pre-training
         model.compile(optimizer=optimizer, loss='binary_crossentropy')
 
-        model.fit(train_data.values, train_data.values, nb_epoch=nb_epoch*2, batch_size=512, verbose=1,
-                  shuffle=True, validation_data=(validate_data.values, validate_data.values))
+        model.fit(train_data_noisy.values, train_data.values, nb_epoch=nb_epoch, batch_size=256, verbose=1,
+                  shuffle=True, validation_data=(validate_data_noisy.values, validate_data.values))
 
         # Supervised training
         classifier.compile(optimizer=optimizer, loss='binary_crossentropy')
-        classifier.fit(train_data.values, np.array(self._training_classes_vec_train), nb_epoch=nb_epoch*5, batch_size=512,
+        classifier.fit(train_data.values, np.array(self._training_classes_vec_train), nb_epoch=nb_epoch*5, batch_size=256,
                        verbose=1, shuffle=True)
 
+        # Restore the training dataset into input_df
         input_df = train_df.append(validate_df)
         input_df = input_df.reset_index(drop=True)
+
         # If there are no features left (i.e., only 'class', 'group', and 'guess' remain in the DF), then there is nothing to do
         if len(input_df.columns) == 3:
             return input_df
@@ -1086,7 +1237,7 @@ class TPOT(object):
             or when it is randomly determined that a a node should be a terminal.
             """
             # Plus 10 height to enable deep pipelines
-            return type_ not in [Encoded_DF, Output_DF, Scaled_DF] or depth == height
+            return type_ not in [Encoded_DF, Output_DF, Scaled_DF, Imputed_DF] or depth == height
 
         return self._generate(pset, min_, max_, condition, type_)
 
